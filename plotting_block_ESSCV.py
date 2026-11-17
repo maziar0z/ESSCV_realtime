@@ -2,6 +2,7 @@
 Based on plotting_block_May25.py (same port 10890, same 1 s update loop).
 
 Color compares the target with the current speed:
+  gray   "--": no advice (no signal ahead within range, or no fresh SPaT from it)
   red    target ~0 (stop at the red light)
   green  target >= current - SLOW_MILD_MPH          (keep going)
   gold   target is SLOW_MILD..SLOW_STRONG mph below  (ease off)
@@ -38,9 +39,15 @@ current_time = datetime.datetime.now()
 last_time = current_time
 
 
+NO_ADVICE = "no advice"
+
+
 def unpack(message):
-    """Display message from warning_block_ESSCV.py (dict); a bare number is treated as the target speed."""
+    """Display message from warning_block_ESSCV.py (dict); a bare number is treated as the target speed.
+    Returns (target_mph or NO_ADVICE, speed_mph)."""
     if isinstance(message, dict):
+        if message.get("target_mph") is None or message.get("advice") is False:
+            return NO_ADVICE, message.get("speed_mph")
         return float(message["target_mph"]), message.get("speed_mph")
     return float(message), None
 
@@ -67,12 +74,22 @@ while True:
         except Exception as e:   # bad packet: keep the last frame
             print('bad display message:', e)
             target_mph, speed_mph = None, None
-        if target_mph is not None and not math.isfinite(target_mph):
+        if target_mph not in (None, NO_ADVICE) and not math.isfinite(target_mph):
             target_mph = None
         if speed_mph is not None and not math.isfinite(speed_mph):
             speed_mph = None
 
-        if target_mph is not None:
+        if target_mph == NO_ADVICE:   # nothing to advise (no signal ahead / no fresh SPaT): neutral gray
+            ax.clear()
+            ax.axis('off')
+            ax.set_xlim(-1, 1)
+            ax.set_ylim(-1, 1)
+            print('no advice  current speed (mph)', None if speed_mph is None else round(speed_mph, 1))
+            plt.plot(0, 0, 'lightgray', alpha=0.6, marker='o', markersize=MIN_SIZE)[0]
+            plt.text(0, 0, "--", ha='center', va='center', fontsize=MIN_SIZE / 3, color='gray', fontweight='bold')
+            plt.draw()
+            plt.pause(0.01)
+        elif target_mph is not None:
             ax.clear()
             ax.axis('off')
             ax.set_xlim(-1, 1)

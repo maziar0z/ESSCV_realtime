@@ -13,6 +13,7 @@ Positions use the simulation's convention: x grows along the road and the stop b
 x = D_SIG - pos_ego where pos_ego is the OBU distance to the stop bar.
 """
 import math
+import time
 import numpy as np
 from scipy.optimize import minimize
 
@@ -25,6 +26,8 @@ SAFE_RANGE = 1.0       # arrive no earlier than green start + 1 s (and no later 
 STOP_DEC = 3.0         # m/s^2: red/yellow stop-bar constraint only if the car can stop at this deceleration
 RED_MARGIN = 1.0       # m: stop this far before the stop bar
 EPS = 1e-5
+TIME_BUDGET = 0.6      # s: stop an MPC solve that takes longer and keep the previous plan (1 Hz loop)
+MAX_ITER = 100         # SLSQP iteration cap
 
 # typical phase lengths for phases after the current one (from the 70 logged road-test runs);
 # only used when the car cannot make the current green
@@ -42,7 +45,10 @@ class SignalTimeline:
 
     ORDER = {"green": ("yellow", TYPICAL_YELLOW), "yellow": ("red", TYPICAL_RED), "red": ("green", TYPICAL_GREEN)}
 
-    def __init__(self, status, sec_to_change, horizon_s=300.0):
+    def __init__(self, status, sec_to_change, horizon_s=300.0, cant_make=None):
+        # cant_make: decision (with hysteresis, made by the caller) whether the car can still make the current
+        # green; None = decide here from the speed limit alone
+        self.cant_make = cant_make
         self.phases = []   # (start, end, status) relative to now
         t, state, end = 0.0, status, max(0.0, float(sec_to_change))
         while t < horizon_s:
@@ -147,7 +153,11 @@ class Optimizer:
                 spat_spd = max(spat_spd, 3)
                 spat_spd_low = spat_spd
                 spat_spd_up = self.freev
-                if spat_spd > self.freev + 0.1: # cannot make it: wait for the next green
+                if t < timeline.green_end(0) and timeline.cant_make is not None:
+                    cant_make = timeline.cant_make   # current green: caller's decision (with hysteresis)
+                else:
+                    cant_make = spat_spd > self.freev + 0.1
+                if cant_make: # cannot make it: wait for the next green
                     g_start, g_end = timeline.next_green(t)
                     spat_spd_low = dist / (g_end - SAFE_RANGE - t)   # arrive before that green ends
                     spat_spd_up = dist / (g_start + SAFE_RANGE - t)  # and not before it starts (+1 s)
@@ -194,8 +204,23 @@ def must_stop(pos_ego, spd_ego, freev, timeline):
         return True
     can_stop = pos_ego - RED_MARGIN >= spd_ego**2 / (2 * STOP_DEC) or spd_ego < 2.0
     if state == "green":
+        if timeline.cant_make is not None:
+            return can_stop and timeline.cant_make
         return can_stop and pos_ego / max(timeline.green_end(0), EPS) > freev + 0.1
     return can_stop
+
+
+def cant_make_green(pos_ego, freev, green_left, previous, hysteresis):
+    """Whether the car can no longer make the current green: the speed needed to reach the bar before the
+    green ends (SPaT earliest end) is above the speed limit. With hysteresis so the decision does not flip
+    every second as the earliest end time moves: once decided, it only changes when the needed speed is
+    more than `hysteresis` m/s on the other side of the limit."""
+    needed = pos_ego / max(green_left, EPS)
+    if previous is None:
+        return needed > freev + 0.1
+    if previous:
+        return needed > freev - hysteresis
+    return needed > freev + hysteresis
 
 
 def stop_speed(pos_ego, spd_ego, plan, t_ahead=1.5):
@@ -211,13 +236,32 @@ def planned_speed(spd_ego, plan, t_ahead):
     return max(0.0, spd_ego + DT * float(np.sum(np.clip(plan[:k], MAX_DEC, MAX_ACC))))
 
 
-def solve_mpc(pos_ego, spd_ego, freev, timeline, warm_start, prev_acc):
-    """One MPC solve. pos_ego = distance to the stop bar (m, >0 before it). Returns (plan, result)."""
+class SolveTimeout(Exception):
+    pass
+
+
+def solve_mpc(pos_ego, spd_ego, freev, timeline, warm_start, prev_acc, time_budget=TIME_BUDGET):
+    """One MPC solve. pos_ego = distance to the stop bar (m, >0 before it). Returns (plan, result).
+    Raises SolveTimeout if the solve runs longer than time_budget seconds (checked every SLSQP iteration);
+    the caller then keeps its previous plan."""
     opt = Optimizer(freev)
     posi_eco = D_SIG - pos_ego
     cons = {"type": "ineq", "fun": opt.constraint0, "args": (posi_eco, spd_ego, timeline)}
-    sol = minimize(opt.objective, warm_start, args=(spd_ego, prev_acc), method="SLSQP", constraints=[cons])
+    t0 = time.time()
+
+    def stop_if_too_long(xk):
+        if time.time() - t0 > time_budget:
+            raise SolveTimeout()
+
+    sol = minimize(opt.objective, warm_start, args=(spd_ego, prev_acc), method="SLSQP", constraints=[cons],
+                   callback=stop_if_too_long, options={"maxiter": MAX_ITER})
     return np.asarray(sol.x, dtype=float), sol
+
+
+def plan_is_usable(plan):
+    """A plan can be used if it is finite and inside the acceleration bounds (failed SLSQP solves can return
+    values far outside them)."""
+    return bool(np.all(np.isfinite(plan)) and plan.max() <= MAX_ACC + 0.1 and plan.min() >= MAX_DEC - 0.1)
 
 
 def initial_guess():

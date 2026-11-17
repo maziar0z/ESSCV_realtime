@@ -104,6 +104,8 @@ dt = 0.2
 signal_id = 0
 
 signal_status = None
+spat_rx_time = None          # ESSCV: wall-clock time the selected signal's SPaT was last decoded
+spat_intersection_id = None  # ESSCV: intersection id carried in that SPaT
 cum_dist = 0
 speed = 0
 neg_dist_counter = 0
@@ -252,6 +254,8 @@ while True:
                         
                         # print("min time to change the status is after ", sec_to_change_min , " sec")     
                         sec_to_change_max = calc_change_time(minute_max, sec_max, moy_minute, sec_of_minute)
+                        spat_rx_time = time.time()                         # ESSCV: freshness of this SPaT
+                        spat_intersection_id = SPaT_data["id"]["id"]       # ESSCV: which intersection it is from
                         # print("max time to change the status is after ", sec_to_change_max , " sec")
                         # 
                     else:
@@ -544,6 +548,9 @@ while True:
         current_approach,
         sec_to_change_min if signal_status is not None else None,   # ESSCV: time to next phase change
         signal_status,                                               # ESSCV: current phase
+        spat_intersection_id,                                        # ESSCV: SPaT's intersection id
+        spat_rx_time,                                                # ESSCV: when that SPaT was decoded
+        signal_id,                                                   # ESSCV: intersection id expected for the current reference
     )
     print('distance', cum_dist,  ' reference ', current_ref_file)
     if signal_status is not None:

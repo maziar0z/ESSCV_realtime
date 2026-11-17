@@ -38,6 +38,9 @@ INIT_PARAMS = {"a": 1.61, "T": 1.5, "s0": 4.0}
 BOUNDS = {"a": (0.4, 4.5), "T": (0.5, 2.0)}   # same as RLRWS; s0 is not calibrated (fixed at 4 m)
 CAL_SUBSTEPS = 10       # integration substeps per tick in the calibration
 CAL_ACC_LIMITS = (-4.5, 3.0)
+MIN_TARGET_CHANGE = 2.0 / 2.23694   # m/s: calibrate only on ticks whose target differed from the speed by >= 2 mph
+PRIOR_TICKS = 20        # the prior toward INIT_PARAMS weighs as much as this many ticks ...
+PRIOR_SCALE = 0.005     # ... each with this squared speed error ((m/s)^2) per 100 % parameter deviation (light: data dominates)
 
 
 def gap_to_use(pos_ego, red_now):
@@ -74,19 +77,20 @@ def passer(pos_ego, spd_ego, red_now):
     return 0 <= pos_ego <= 60 and spd_ego <= 4 and red_now
 
 
-def display_target(acc_mpc, spd, pos_ego, red_now, freev, params, in_range, stop_speed=None, restart_speed=None):
-    """Target speed (m/s) for the display, including the out-of-range and stop-at-red cases.
+def display_target(acc_mpc, spd, pos_ego, red_now, freev, params, advice_ok, stop_speed=None, restart_speed=None):
+    """Target speed (m/s) for the display, including the no-advice and stop-at-red cases.
+    advice_ok: approaching a signal within range with fresh SPaT from the right intersection. Otherwise
+    there is nothing to advise and the display shows a neutral 'no advice' (target None), never a speed
+    limit (it can belong to an approach already passed) and never a red/gold circle.
     stop_speed: the MPC's planned speed ~1 s ahead when it must stop for a red (else None); the display
     never shows more than that, because the IDM inversion alone cannot ask for a stop (no leader).
     restart_speed: the MPC's planned speed ~3 s ahead. When the car is slow and the MPC wants to accelerate,
     the display shows at least that, because the inversion (target proportional to the current speed) can
     only suggest a few mph more than the current speed when starting from (near) standstill.
-    Returns (target, source); source says which rule set the value ("limit", "passer", "stop", "restart",
+    Returns (target, source); source says which rule set the value ("none", "passer", "stop", "restart",
     "idm"). Only "idm" rows are used for calibration: the others are not IDM-inversion outputs."""
-    if pos_ego < 0:
-        return freev, "limit"           # passed the stop bar: back to free-flow speed
-    if not in_range:   # no signal ahead within range / no SPaT: speed limit
-        return freev, "limit"
+    if pos_ego < 0 or not advice_ok:
+        return None, "none"
     if passer(pos_ego, spd, red_now):
         return 0.0, "passer"
     target = target_speed(acc_mpc, spd, pos_ego, red_now, freev, params)
@@ -113,6 +117,11 @@ def load_calibration_rows(csv_path):
     if df.empty or not need.issubset(df.columns):
         return None
     idm_shown = df["display_source"].eq("idm") if "display_source" in df else pd.Series(True, index=df.index)
+    # only ticks the driver had a reason to follow: fresh SPaT from the right intersection, and a target that
+    # asked for a real change (on the road, ticks with stale/uninformative advice taught it 'unresponsive')
+    fresh = df["spat_fresh"].astype(str).str.lower().eq("true") if "spat_fresh" in df else pd.Series(True, index=df.index)
+    asks_change = (df["target_speed_mps"] - df["spd_ego"]).abs() >= MIN_TARGET_CHANGE
+    idm_shown = idm_shown & fresh & asks_change
     try:
         t = pd.to_datetime(df["timestamp"], format="mixed", errors="coerce")
     except (TypeError, ValueError):
@@ -142,9 +151,14 @@ def integrate_ticks(params, spd, v0_shown, pos, red, dt, n=CAL_SUBSTEPS):
 
 def calibrate(rows, params):
     """Least-squares fit of (a, T) to the measured speed at the next tick, integrating the IDM over each tick;
-    s0 is kept as is. Returns (new params dict, J = mean squared speed error, (m/s)^2)."""
+    s0 is kept as is. A prior pulls (a, T) toward INIT_PARAMS with the weight of PRIOR_TICKS ticks, so few or
+    noisy ticks can't drag the parameters to their bounds; with many informative ticks the data dominates.
+    Returns (new params dict, J = mean squared speed error, (m/s)^2, without the prior term)."""
     spd, v0_shown, pos, red, v_next, dt = rows
     s0 = params["s0"]
-    J = lambda x: float(np.mean((integrate_ticks([x[0], x[1], s0], spd, v0_shown, pos, red, dt) - v_next) ** 2))
+    a0, T0 = INIT_PARAMS["a"], INIT_PARAMS["T"]
+    w = PRIOR_TICKS / len(spd)
+    fit = lambda x: float(np.mean((integrate_ticks([x[0], x[1], s0], spd, v0_shown, pos, red, dt) - v_next) ** 2))
+    J = lambda x: fit(x) + w * PRIOR_SCALE * (((x[0] - a0) / a0) ** 2 + ((x[1] - T0) / T0) ** 2)
     res = minimize(J, [params["a"], params["T"]], method="L-BFGS-B", bounds=[BOUNDS["a"], BOUNDS["T"]])
-    return {"a": float(res.x[0]), "T": float(res.x[1]), "s0": s0}, float(res.fun)
+    return {"a": float(res.x[0]), "T": float(res.x[1]), "s0": s0}, fit(res.x)

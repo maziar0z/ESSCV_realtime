@@ -6,7 +6,8 @@ Same pipeline position and ports as warning_block_Jianshe.py:
 Every 1 s:
   1. ESSCV MPC (esscv_optimization.py, no leader) with the SPaT timeline from the OBU message
   2. MPC acceleration 1 s ahead -> target speed via the calibrated IDM (esscv_driver_model.py)
-  3. send {target speed, current speed, speed limit} for display, log the row
+     (only with fresh SPaT from the current intersection, within 500 m; otherwise 'no advice', MPC skipped)
+  3. send {target speed or None, current speed} for display, log the row
   4. every 10 s: recalibrate the IDM on this run's data and blend 50/50 (as RLRWS does)
 A failure in one tick is logged and the loop continues with the next tick.
 """
@@ -27,6 +28,8 @@ import esscv_driver_model as dm
 
 TEST_NAME = "esscv_test"
 CALIBRATION_INTERVAL = 10       # s
+SPAT_MAX_AGE = 2.0              # s: older SPaT (stopped arriving / out of RSU range) is not used
+CANT_MAKE_HYSTERESIS = 1.0      # m/s: "can't make the green" only flips when clearly on the other side
 MIN_CALIBRATION_ROWS = 10
 DEFAULT_FF_SPD = 24.5           # m/s, used only if the OBU message has no ff_spd (RLRWS v0)
 MPS_TO_MPH = 2.23694
@@ -62,6 +65,7 @@ J_final = None
 plan = eo.initial_guess()      # last MPC plan (accelerations, 0.5 s steps)
 prev_acc = 0.0                 # car's acceleration over the last tick (jerk term)
 spd_prev, prev_tick = None, None
+cant_make_prev, cant_make_key = None, None   # hysteresis state for "can't make the current green"
 
 
 def append_csv_row(csv_path, row):
@@ -88,67 +92,91 @@ def clean_sec_to_change(sec):
     return max(0.0, sec)
 
 
-def signal_info(msg_data, predicted_tl_state):
-    """(status, sec_to_change, red_now) from the OBU message; red_now falls back to the 10 s preview."""
-    status = getattr(msg_data, "signal_status", None) if msg_data is not None else None
-    sec = clean_sec_to_change(getattr(msg_data, "sec_to_change", None) if msg_data is not None else None)
-    if status in ("red", "yellow"):
-        red_now = True
-    elif status == "green":
-        red_now = False
-    else:   # 0 red, -1 yellow, 1 green
-        red_now = float(np.asarray(predicted_tl_state).reshape(-1)[0]) != 1
-    return status, sec, red_now
+def signal_info(msg_data):
+    """Signal state from the OBU message, used only if it is fresh and from the right intersection.
+    Returns (status, sec_to_change, red_now, fresh, age, spat_intersection_id, expected_signal_id).
+    sec_to_change is the SPaT earliest change time (minEndTime), counted down by the SPaT's age.
+    Stale or foreign SPaT (e.g. the last SPaT of the previous intersection carried over to an intersection
+    that sends none, as at ref_3 on 2026-11-12) gives status None: no advice."""
+    get = lambda name: getattr(msg_data, name, None) if msg_data is not None else None
+    status, sec = get("signal_status"), clean_sec_to_change(get("sec_to_change"))
+    spat_id, rx, expected = get("spat_intersection_id"), get("spat_rx_time"), get("expected_signal_id")
+    age = time.time() - rx if rx is not None else None
+    fresh = (status is not None and sec is not None and age is not None and age <= SPAT_MAX_AGE
+             and (expected is None or spat_id == expected))
+    if not fresh:
+        return None, None, False, False, age, spat_id, expected
+    sec = max(0.0, sec - max(age, 0.0))
+    return status, sec, status in ("red", "yellow"), True, age, spat_id, expected
 
 
 def run_tick(data_orig, msg_data):
     global plan, prev_acc, spd_prev, prev_tick, idm_params, J_final, last_calibration_time
+    global cant_make_prev, cant_make_key
     predicted_tl_state = data_orig.predicted_tl_state
     pos_ego = float(data_orig.pos_ego)
     spd_ego = float(data_orig.spd_ego)
     ff_spd = getattr(msg_data, "ff_spd", None) or DEFAULT_FF_SPD
-    status, sec_to_change, red_now = signal_info(msg_data, predicted_tl_state)
-    in_range = 0 <= pos_ego <= eo.D_SIG and status is not None and sec_to_change is not None
+    status, sec_to_change, red_now, fresh, spat_age, spat_id, expected_id = signal_info(msg_data)
+    # advice only when approaching a signal within range with fresh SPaT from that intersection
+    # (placeholder distances 1000 / 1500 m from the OBU are outside the range)
+    advice_ok = fresh and 0 <= pos_ego <= eo.D_SIG
     # the human drives, so the jerk term uses the car's measured acceleration over the last tick
     if spd_prev is not None and prev_tick is not None:
         prev_acc = float(np.clip((spd_ego - spd_prev) / max((current_time - prev_tick).total_seconds(), 0.5),
                                  eo.MAX_DEC, eo.MAX_ACC))
     spd_prev, prev_tick = spd_ego, current_time
 
-    # 1. MPC
+    # "can't make the current green" with hysteresis (reset on a new approach or when not green)
+    cant_make = None
+    key = (getattr(data_orig, "current_intersection", None), getattr(data_orig, "current_approach", None))
+    if advice_ok and status == "green":
+        previous = cant_make_prev if key == cant_make_key else None
+        cant_make = eo.cant_make_green(pos_ego, ff_spd, sec_to_change, previous, CANT_MAKE_HYSTERESIS)
+    cant_make_prev, cant_make_key = cant_make, key
+
+    # 1. MPC (skipped when there is nothing to advise; capped in time, previous plan kept if it can't finish)
     t0 = time.time()
-    timeline = eo.SignalTimeline(status, sec_to_change) if in_range else None
-    mpc_ok, mpc_msg = None, ""
-    try:
-        warm = eo.shifted_warm_start(plan)
-        plan, sol = eo.solve_mpc(pos_ego, spd_ego, ff_spd, timeline, warm, prev_acc)
-        mpc_ok, mpc_msg = bool(sol.success), str(sol.message)
-    except Exception:
-        traceback.print_exc()
+    timeline = eo.SignalTimeline(status, sec_to_change, cant_make=cant_make) if advice_ok else None
+    mpc_ok, mpc_msg, mpc_fallback = None, "skipped (no advice)", False
+    if advice_ok:
+        warm = eo.shifted_warm_start(plan)   # previous plan, shifted to now
+        try:
+            new_plan, sol = eo.solve_mpc(pos_ego, spd_ego, ff_spd, timeline, warm, prev_acc)
+            if eo.plan_is_usable(new_plan):
+                plan, mpc_ok, mpc_msg = new_plan, bool(sol.success), str(sol.message)
+            else:
+                plan, mpc_ok, mpc_msg, mpc_fallback = warm, False, "unusable plan: previous plan used", True
+        except eo.SolveTimeout:
+            plan, mpc_ok, mpc_msg, mpc_fallback = warm, False, f"over {eo.TIME_BUDGET} s: previous plan used", True
+        except Exception:
+            traceback.print_exc()
+            plan, mpc_ok, mpc_msg, mpc_fallback = warm, False, "solver error: previous plan used", True
+    else:
         plan = eo.initial_guess()
-    if not np.all(np.isfinite(plan)):   # failed solve with NaN/inf: no suggestion this tick
-        mpc_ok, mpc_msg = False, "non-finite plan"
-        plan = eo.initial_guess() * 0
     mpc_time = time.time() - t0
     # suggestion 1 s ahead (reaction time), clipped like the simulation
     desired_acc = float(np.clip(plan[2], eo.MAX_DEC * 0.7, eo.MAX_ACC * 0.7))
 
-    # 2. target speed (speed limit out of range, 0 for the passer stop case, else IDM inversion,
+    # 2. target speed (no advice -> None; 0 for the passer stop case; else IDM inversion,
     #    capped by the MPC's stopping plan before a red, floored by its plan when restarting)
-    must_stop = eo.must_stop(pos_ego, spd_ego, ff_spd, timeline)
+    must_stop = advice_ok and eo.must_stop(pos_ego, spd_ego, ff_spd, timeline)
     stop_speed = eo.stop_speed(pos_ego, spd_ego, plan) if must_stop else None
-    restart_speed = eo.planned_speed(spd_ego, plan, dm.RESTART_AHEAD)
+    restart_speed = eo.planned_speed(spd_ego, plan, dm.RESTART_AHEAD) if advice_ok else None
     target, display_source = dm.display_target(desired_acc, spd_ego, pos_ego, red_now, ff_spd, idm_params,
-                                               in_range, stop_speed, restart_speed)
-    if not math.isfinite(target):
-        target, display_source = ff_spd, "fallback"
+                                               advice_ok, stop_speed, restart_speed)
+    if target is not None and not math.isfinite(target):
+        target, display_source = None, "none"
 
     # 3. display + log
-    display = {"target_mph": target * MPS_TO_MPH, "speed_mph": spd_ego * MPS_TO_MPH,
-               "speed_limit_mph": ff_spd * MPS_TO_MPH}
+    display = {"target_mph": None if target is None else target * MPS_TO_MPH, "speed_mph": spd_ego * MPS_TO_MPH,
+               "advice": target is not None}
     s_send.sendto(pkl.dumps(display), (HOST_SEND, PORT_SEND))
+    shown = "  --  " if target is None else f"{target*MPS_TO_MPH:5.1f} mph"
     print(f"pos {pos_ego:7.1f} m  spd {spd_ego*MPS_TO_MPH:5.1f} mph  {status} {sec_to_change}  "
-          f"MPC acc {desired_acc:+.2f}  -> target {target*MPS_TO_MPH:5.1f} mph [{display_source}]  ({mpc_time:.2f}s)")
+          f"MPC acc {desired_acc:+.2f}  -> target {shown} [{display_source}]  "
+          f"({mpc_time:.2f}s{', fallback' if mpc_fallback else ''})")
+    target_mps = float("nan") if target is None else target
     row = {
         "timestamp": current_time, "pos_ego": pos_ego, "spd_ego": spd_ego,
         "current_ref_file": getattr(data_orig, "current_ref_file", None),
@@ -156,12 +184,18 @@ def run_tick(data_orig, msg_data):
         "current_approach": getattr(data_orig, "current_approach", None),
         "ff_spd": ff_spd, "signal_status": status, "sec_to_change": sec_to_change,
         "sec_to_change_raw": getattr(msg_data, "sec_to_change", None) if msg_data is not None else None,
+        "signal_status_raw": getattr(msg_data, "signal_status", None) if msg_data is not None else None,
+        "spat_fresh": fresh, "spat_age_s": None if spat_age is None else round(spat_age, 2),
+        "spat_intersection_id": spat_id, "expected_signal_id": expected_id,
         "red_now": red_now, "tl_now": float(np.asarray(predicted_tl_state).reshape(-1)[0]),
-        "mpc_success": mpc_ok, "mpc_message": mpc_msg, "mpc_time_s": round(mpc_time, 3),
+        "cant_make": cant_make,
+        "mpc_success": mpc_ok, "mpc_message": mpc_msg, "mpc_fallback": mpc_fallback,
+        "mpc_time_s": round(mpc_time, 3),
         "mpc_acc_0": plan[0], "mpc_acc_1": plan[1], "mpc_acc_2": plan[2], "mpc_acc_3": plan[3],
         "desired_acc": desired_acc, "must_stop": must_stop, "stop_speed": stop_speed,
         "restart_speed": restart_speed,
-        "target_speed_mps": target, "target_speed_mph": target * MPS_TO_MPH, "display_source": display_source,
+        "target_speed_mps": target_mps, "target_speed_mph": target_mps * MPS_TO_MPH,
+        "display_source": display_source,
         "idm_a": idm_params["a"], "idm_T": idm_params["T"], "idm_s0": idm_params["s0"],
     }
     append_csv_row(Record_data, row)
